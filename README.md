@@ -1,3 +1,7 @@
+<img width="1388" height="743" alt="Screenshot_20260707_220937" src="https://github.com/user-attachments/assets/f6f25569-dd60-4002-a2a6-3497be8621a4" />
+
+
+
 # Installation
 
 1. Install the Tampermonkey browser extension: https://www.tampermonkey.net/
