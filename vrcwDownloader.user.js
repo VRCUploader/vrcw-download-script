@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VRChat World Search — Download Button
 // @namespace    https://vrchat.com/
-// @version      1.4
-// @description  Adds a download button inside each world card in VRChat search results. Resolves the newest PC (standalonewindows) bundle and downloads the .vrcw.
+// @version      1.8
+// @description  Adds a download button + version picker to VRChat world search results, "My Worlds", and individual world pages. Downloads the chosen PC (standalonewindows) .vrcw bundle.
 // @author       VRCUploader Team
 // @match        https://vrchat.com/*
 // @run-at       document-idle
@@ -14,22 +14,29 @@
 (function () {
     'use strict';
 
-    const WORLD_LINK_SELECTOR = 'a[href*="/home/world/wrld_"]';
-    const THUMB_SELECTOR = 'a[href*="/home/world/wrld_"] img';
+    const WORLD_LINK = 'a[href*="/home/world/wrld_"]';
     const WORLD_ID_RE = /(wrld_[0-9a-fA-F-]{36})/;
-    const VERSION_RE = /\/file\/[^/]+\/(\d+)\//;
+    const VERSION_RE = /\/file\/[^/]+\/(\d+)\//; // .../file/file_xxx/485/file -> 485
 
-    // ---- styling -----------------------------------------------------------
     const style = document.createElement('style');
     style.textContent = `
-        .vrcw-dl-btn {
-            display: block;
-            width: calc(100% - 24px);
+        .vrcw-row {
+            display: flex;
+            gap: 8px;
+            align-items: stretch;
             margin: 12px;
+        }
+        .vrcw-row.vrcw-detail { margin: 12px 0; }
+        .vrcw-dl-btn {
+            flex: 1 1 auto;
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
             padding: 10px 12px;
             box-sizing: border-box;
             font: 600 14px/1 system-ui, sans-serif;
-            text-align: center;
             color: #fff;
             background: rgba(50, 120, 220, 0.9);
             border: 1px solid rgba(255,255,255,0.2);
@@ -39,16 +46,70 @@
             white-space: nowrap;
             transition: background .15s ease;
         }
-        .vrcw-dl-btn:hover  { background: rgba(60, 140, 240, 1); }
+        .vrcw-dl-btn:hover { background: rgba(60, 140, 240, 1); }
         .vrcw-dl-btn[disabled] { opacity: .7; cursor: default; }
         .vrcw-dl-btn.err { background: rgba(190, 40, 40, 0.95); }
         .vrcw-dl-btn.ok  { background: rgba(40, 150, 70, 0.95); }
+
+        .vrcw-ver { position: relative; flex: 0 0 auto; }
+        .vrcw-ver-trigger {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 12px;
+            font: 600 14px/1 system-ui, sans-serif;
+            color: #fff;
+            background: rgba(60, 60, 70, 0.9);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 8px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .vrcw-ver-trigger:hover { background: rgba(80, 80, 95, 1); }
+        .vrcw-ver-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            right: 0;
+            min-width: 130px;
+            max-height: 240px;
+            overflow-y: auto;
+            background: #1c1c22;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 8px;
+            z-index: 9999;
+            box-shadow: 0 6px 20px rgba(0,0,0,.5);
+        }
+        .vrcw-ver-item {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 8px 12px;
+            background: none;
+            border: 0;
+            color: #fff;
+            font: 500 13px/1 system-ui, sans-serif;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .vrcw-ver-item:hover { background: rgba(50, 120, 220, 0.9); }
+        .vrcw-ver-msg {
+            padding: 8px 12px;
+            color: #ddd;
+            font: 500 13px/1 system-ui, sans-serif;
+        }
+        .vrcw-ver-msg.err { color: #ff8080; cursor: pointer; }
     `;
     document.head.appendChild(style);
 
-    // ---- API + download logic ---------------------------------------------
+    // ------------------------------------------------------------------
+    // API
+    // ------------------------------------------------------------------
 
-    async function getUnityPackages(worldId) {
+    // One fetch per world, shared between the button and the dropdown.
+    const versionCache = new Map();
+
+    async function fetchUnityPackages(worldId) {
         const endpoints = [
             `https://vrchat.com/api/1/worlds/${worldId}/files`,
             `https://vrchat.com/api/1/worlds/${worldId}`,
@@ -57,140 +118,290 @@
             try {
                 const res = await fetch(url, { credentials: 'include' });
                 if (!res.ok) continue;
-                const data = await res.json();
-                const pkgs = extractPackages(data);
-                if (pkgs && pkgs.length) return pkgs;
-            } catch (e) { /* try next */ }
+                const packages = readPackages(await res.json());
+                if (packages.length) return packages;
+            } catch (e) {
+                // try the next endpoint
+            }
         }
-        return null;
+        return [];
     }
 
-    function extractPackages(data) {
-        if (!data) return null;
+    // The response shape varies: a world object, an array of files, or {unityPackages}.
+    function readPackages(data) {
+        if (!data) return [];
         if (Array.isArray(data.unityPackages)) return data.unityPackages;
         if (Array.isArray(data)) {
-            const flat = [];
-            for (const item of data) {
-                if (item && Array.isArray(item.unityPackages)) flat.push(...item.unityPackages);
+            return data.flatMap(item =>
+                item && Array.isArray(item.unityPackages) ? item.unityPackages : []);
+        }
+        return [];
+    }
+
+    function toVersionList(packages) {
+        const versions = [];
+        for (const pkg of packages) {
+            if (!pkg || pkg.platform !== 'standalonewindows') continue; // PC only
+            const asset = pkg.assetUrl;
+            if (!asset || asset.includes('/variant/')) continue;        // skip the security variant
+            const match = asset.match(VERSION_RE);
+            versions.push({
+                version: match ? parseInt(match[1], 10) : (pkg.assetVersion || 0),
+                url: asset.replace('api.vrchat.cloud', 'vrchat.com'),   // logged-in host
+            });
+        }
+        versions.sort((a, b) => b.version - a.version);
+
+        const seen = new Set();
+        return versions.filter(v => !seen.has(v.version) && seen.add(v.version));
+    }
+
+    function getVersions(worldId) {
+        if (!versionCache.has(worldId)) {
+            const promise = fetchUnityPackages(worldId).then(packages => {
+                const list = toVersionList(packages);
+                if (!list.length) throw new Error('No PC bundle found (are you logged in?)');
+                return list;
+            });
+            promise.catch(() => versionCache.delete(worldId)); // let a failed lookup retry
+            versionCache.set(worldId, promise);
+        }
+        return versionCache.get(worldId);
+    }
+
+    function download(url) {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = '';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    }
+
+    // ------------------------------------------------------------------
+    // Controls
+    // ------------------------------------------------------------------
+
+    function makeControls(worldId) {
+        const row = document.createElement('div');
+        row.className = 'vrcw-row';
+
+        let selected = 'latest';
+        let loaded = null;
+
+        // --- download button ---
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'vrcw-dl-btn';
+        button.title = 'Download PC (.vrcw) bundle';
+        button.innerHTML = '<span class="vrcw-lbl">⬇ Download VRCW</span>';
+        const label = button.querySelector('.vrcw-lbl');
+
+        button.addEventListener('mousedown', swallow);
+        button.addEventListener('click', async ev => {
+            swallow(ev);
+            if (button.dataset.busy) return;
+            button.dataset.busy = '1';
+            button.disabled = true;
+            button.classList.remove('err', 'ok');
+
+            try {
+                label.textContent = 'Fetching…';
+                const list = await getVersions(worldId);
+                const entry = selected === 'latest'
+                    ? list[0]
+                    : list.find(v => String(v.version) === selected) || list[0];
+                download(entry.url);
+                flash('ok', `Downloading v${entry.version} ✓`);
+            } catch (err) {
+                console.error('[VRCW]', err);
+                button.title = String(err.message || err);
+                flash('err', 'Error — tap to retry');
             }
-            if (flat.length) return flat;
+        });
+
+        function flash(state, text) {
+            button.classList.add(state);
+            label.textContent = text;
+            setTimeout(() => {
+                button.classList.remove(state);
+                label.textContent = '⬇ Download VRCW';
+                button.disabled = false;
+                delete button.dataset.busy;
+            }, state === 'ok' ? 2500 : 3000);
         }
-        return null;
-    }
 
-    function pickBestUrl(packages) {
-        let best = null, bestVersion = -1;
-        for (const p of packages) {
-            if (!p || p.platform !== 'standalonewindows') continue;   // PC only
-            const asset = p.assetUrl;
-            if (!asset) continue;                                     // skip empty
-            if (asset.includes('/variant/')) continue;                // skip security variant
-            const m = asset.match(VERSION_RE);
-            const version = m ? parseInt(m[1], 10) : (p.assetVersion || 0);
-            if (version > bestVersion) { bestVersion = version; best = asset; }
+        // --- version dropdown ---
+        const picker = document.createElement('div');
+        picker.className = 'vrcw-ver';
+
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.className = 'vrcw-ver-trigger';
+        trigger.textContent = 'Latest ▾';
+
+        const menu = document.createElement('div');
+        menu.className = 'vrcw-ver-menu';
+        menu.hidden = true;
+
+        picker.append(trigger, menu);
+
+        const closeOnOutside = e => { if (!picker.contains(e.target)) close(); };
+        function open()  { menu.hidden = false; document.addEventListener('click', closeOnOutside, true); }
+        function close() { menu.hidden = true;  document.removeEventListener('click', closeOnOutside, true); }
+
+        function renderMenu(list) {
+            menu.innerHTML = '';
+            const options = [{ value: 'latest', text: `Latest (v${list[0].version})` }]
+                .concat(list.map(v => ({ value: String(v.version), text: `v${v.version}` })));
+
+            for (const opt of options) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = 'vrcw-ver-item';
+                item.textContent = opt.text;
+                item.addEventListener('click', e => {
+                    swallow(e);
+                    selected = opt.value;
+                    trigger.textContent = (opt.value === 'latest' ? 'Latest' : opt.text) + ' ▾';
+                    close();
+                });
+                menu.appendChild(item);
+            }
         }
-        if (!best) return null;
-        return best.replace('api.vrchat.cloud', 'vrchat.com');
-    }
 
-    function triggerDownload(url) {
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = '';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-    }
-
-    async function handleClick(worldId, btn, ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (btn.dataset.busy) return;
-        btn.dataset.busy = '1';
-        btn.disabled = true;
-        btn.classList.remove('err', 'ok');
-        const label = btn.querySelector('.vrcw-lbl');
-        const restore = () => { btn.disabled = false; delete btn.dataset.busy; };
-
-        try {
-            label.textContent = 'Fetching…';
-            const pkgs = await getUnityPackages(worldId);
-            if (!pkgs) throw new Error('no packages (are you logged in?)');
-            const url = pickBestUrl(pkgs);
-            if (!url) throw new Error('no PC bundle found');
-            triggerDownload(url);
-            btn.classList.add('ok');
-            label.textContent = 'Downloading ✓';
-            setTimeout(() => { btn.classList.remove('ok'); label.textContent = '⬇ Download VRCW'; restore(); }, 2500);
-        } catch (err) {
-            console.error('[VRCW] ', err);
-            btn.classList.add('err');
-            label.textContent = 'Error — tap to retry';
-            btn.title = String(err.message || err);
-            setTimeout(() => { btn.classList.remove('err'); label.textContent = '⬇ Download VRCW'; restore(); }, 3000);
+        async function loadMenu() {
+            menu.innerHTML = '<div class="vrcw-ver-msg">Loading…</div>';
+            try {
+                loaded = await getVersions(worldId);
+                renderMenu(loaded);
+            } catch (err) {
+                console.error('[VRCW]', err);
+                loaded = null;
+                const msg = document.createElement('div');
+                msg.className = 'vrcw-ver-msg err';
+                msg.textContent = 'Error — tap to retry';
+                msg.addEventListener('click', e => { e.stopPropagation(); loadMenu(); });
+                menu.innerHTML = '';
+                menu.appendChild(msg);
+            }
         }
+
+        trigger.addEventListener('mousedown', e => e.stopPropagation());
+        trigger.addEventListener('click', e => {
+            swallow(e);
+            if (!menu.hidden) return close();
+            open();
+            loaded ? renderMenu(loaded) : loadMenu();
+        });
+
+        row.append(button, picker);
+        return row;
     }
 
-    // ---- DOM injection -----------------------------------------------------
-
-    function makeButton(worldId) {
-        const btn = document.createElement('button');
-        btn.className = 'vrcw-dl-btn';
-        btn.type = 'button';
-        btn.title = 'Download PC (.vrcw) bundle';
-        btn.innerHTML = '<span class="vrcw-lbl">⬇ Download VRCW</span>';
-        const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
-        btn.addEventListener('mousedown', stop);
-        btn.addEventListener('click', (e) => handleClick(worldId, btn, e));
-        return btn;
+    function swallow(e) {
+        e.preventDefault();
+        e.stopPropagation();
     }
 
-    function hasVisibleFrame(el) {
+    // ------------------------------------------------------------------
+    // Placement
+    // ------------------------------------------------------------------
+
+    function currentWorldId() {
+        const m = location.pathname.match(WORLD_ID_RE);
+        return m ? m[1] : null;
+    }
+
+    function countWorlds(el) {
+        const ids = new Set();
+        el.querySelectorAll(WORLD_LINK).forEach(a => {
+            const m = (a.getAttribute('href') || '').match(WORLD_ID_RE);
+            if (m) ids.add(m[1]);
+        });
+        return ids.size;
+    }
+
+    function isFramed(el) {
         const cs = getComputedStyle(el);
-        const bw = parseFloat(cs.borderTopWidth) || 0;
-        const ow = parseFloat(cs.outlineWidth) || 0;
-        return (bw > 0 && cs.borderTopStyle !== 'none') ||
-               (ow > 0 && cs.outlineStyle !== 'none');
+        const border = parseFloat(cs.borderTopWidth) || 0;
+        const outline = parseFloat(cs.outlineWidth) || 0;
+        return (border > 0 && cs.borderTopStyle !== 'none') ||
+               (outline > 0 && cs.outlineStyle !== 'none');
     }
 
-    // Climb from the thumbnail anchor, staying within this single card, and
-    // return the OUTERMOST ancestor that has a visible border/outline (the
-    // teal frame). Fall back to the top single-card wrapper if none is found.
+    // Walk up until the parent would include a second world, keeping track of
+    // the outermost bordered ancestor (the framed search-result card).
     function findCard(anchor) {
-        let el = anchor;
+        let card = anchor;
         let framed = null;
-        while (el.parentElement && el.parentElement !== document.body) {
-            const parent = el.parentElement;
-            if (parent.querySelectorAll(THUMB_SELECTOR).length > 1) break;
-            el = parent;
-            if (hasVisibleFrame(el)) framed = el;   // keep highest framed one
+        while (card.parentElement && card.parentElement !== document.body) {
+            if (countWorlds(card.parentElement) > 1) break;
+            card = card.parentElement;
+            if (isFramed(card)) framed = card;
         }
-        return framed || el;
+        return { card, framed };
     }
 
-    function inject(anchor) {
-        if (!anchor.querySelector('img')) return;   // thumbnail anchor only
-        if (anchor.dataset.vrcwDone) return;
-        const m = anchor.href.match(WORLD_ID_RE);
-        if (!m) return;
-        anchor.dataset.vrcwDone = '1';
+    function place(card, framed, controls) {
+        // Search cards: drop it below the tags, inside the frame.
+        if (framed) return framed.appendChild(controls);
 
-        const card = findCard(anchor);
-        if (card.querySelector('.vrcw-dl-btn')) return;   // safety net
-        card.appendChild(makeButton(m[1]));
+        // My Worlds tiles have no frame and a fixed height that clips a bottom
+        // child, so sit the controls just after the title row instead.
+        const links = [...card.querySelectorAll(WORLD_LINK)];
+        const title = links.find(a => !a.querySelector('img')) || links[0];
+        if (title && title.parentElement && card.contains(title.parentElement)) {
+            title.parentElement.insertAdjacentElement('afterend', controls);
+        } else {
+            card.appendChild(controls);
+        }
     }
 
-    function scan(root) {
-        (root || document).querySelectorAll(WORLD_LINK_SELECTOR).forEach(inject);
+    function addToCards(root) {
+        root.querySelectorAll(WORLD_LINK).forEach(anchor => {
+            const m = (anchor.getAttribute('href') || '').match(WORLD_ID_RE);
+            if (!m || m[1] === currentWorldId()) return; // detail page handles its own world
+
+            const { card, framed } = findCard(anchor);
+            if (!card.querySelector('img')) return;             // not a real card
+            if (card.querySelector('.vrcw-dl-btn')) return;     // already added
+
+            place(card, framed, makeControls(m[1]));
+        });
     }
 
-    scan(document);
+    function addToWorldPage() {
+        const worldId = currentWorldId();
+        const existing = document.querySelector('.vrcw-detail');
 
-    let pending = false;
-    const observer = new MutationObserver(() => {
-        if (pending) return;
-        pending = true;
-        requestAnimationFrame(() => { pending = false; scan(document); });
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+        if (!worldId) return existing && existing.remove();
+        if (existing) {
+            if (existing.dataset.worldId === worldId) return;
+            existing.remove(); // navigated to a different world
+        }
+
+        const info = document.querySelector('[aria-label="World Info"]');
+        if (!info || !info.parentElement) return; // still rendering
+
+        const controls = makeControls(worldId);
+        controls.classList.add('vrcw-detail');
+        controls.dataset.worldId = worldId;
+        info.parentElement.appendChild(controls);
+    }
+
+    function refresh() {
+        addToCards(document);
+        addToWorldPage();
+    }
+
+    refresh();
+
+    // VRChat is a SPA, so re-scan as cards and pages render in.
+    let queued = false;
+    new MutationObserver(() => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => { queued = false; refresh(); });
+    }).observe(document.body, { childList: true, subtree: true });
 })();
