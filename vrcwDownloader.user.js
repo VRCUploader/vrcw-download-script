@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VRChat World Search — Download Button
 // @namespace    https://vrchat.com/
-// @version      1.8
-// @description  Adds a download button + version picker to VRChat world search results, "My Worlds", and individual world pages. Downloads the chosen PC (standalonewindows) .vrcw bundle.
+// @version      2.0
+// @description  Adds a download button + version picker to VRChat world search results, "My Worlds", Discover Worlds, and individual world pages. Downloads the chosen PC (standalonewindows) .vrcw bundle.
 // @author       VRCUploader Team
 // @match        https://vrchat.com/*
 // @run-at       document-idle
@@ -27,6 +27,13 @@
             margin: 12px;
         }
         .vrcw-row.vrcw-detail { margin: 12px 0; }
+        .vrcw-overlay {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            margin: 0;
+            z-index: 20;
+        }
         .vrcw-dl-btn {
             flex: 1 1 auto;
             min-width: 0;
@@ -67,17 +74,24 @@
             white-space: nowrap;
         }
         .vrcw-ver-trigger:hover { background: rgba(80, 80, 95, 1); }
+
+        .vrcw-compact .vrcw-dl-btn,
+        .vrcw-compact .vrcw-ver-trigger {
+            flex: 0 0 auto;
+            padding: 6px 9px;
+            font-size: 12px;
+        }
+
+        /* Lives in <body> so a card's overflow:hidden can't clip it. */
         .vrcw-ver-menu {
-            position: absolute;
-            top: calc(100% + 4px);
-            right: 0;
+            position: fixed;
             min-width: 130px;
             max-height: 240px;
             overflow-y: auto;
             background: #1c1c22;
             border: 1px solid rgba(255,255,255,0.2);
             border-radius: 8px;
-            z-index: 9999;
+            z-index: 99999;
             box-shadow: 0 6px 20px rgba(0,0,0,.5);
         }
         .vrcw-ver-item {
@@ -178,130 +192,158 @@
         link.remove();
     }
 
+    function swallow(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+
     // ------------------------------------------------------------------
     // Controls
     // ------------------------------------------------------------------
 
-    function makeControls(worldId) {
+    function makeControls(worldId, { compact = false } = {}) {
         const row = document.createElement('div');
-        row.className = 'vrcw-row';
+        row.className = compact ? 'vrcw-row vrcw-compact' : 'vrcw-row';
 
         let selected = 'latest';
-        let loaded = null;
+        row.append(makeButton(), makePicker());
+        return row;
 
-        // --- download button ---
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'vrcw-dl-btn';
-        button.title = 'Download PC (.vrcw) bundle';
-        button.innerHTML = '<span class="vrcw-lbl">⬇ Download VRCW</span>';
-        const label = button.querySelector('.vrcw-lbl');
+        function makeButton() {
+            const idle = compact ? '⬇ VRCW' : '⬇ Download VRCW';
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'vrcw-dl-btn';
+            button.title = 'Download PC (.vrcw) bundle';
+            button.innerHTML = `<span class="vrcw-lbl">${idle}</span>`;
+            const label = button.querySelector('.vrcw-lbl');
 
-        button.addEventListener('mousedown', swallow);
-        button.addEventListener('click', async ev => {
-            swallow(ev);
-            if (button.dataset.busy) return;
-            button.dataset.busy = '1';
-            button.disabled = true;
-            button.classList.remove('err', 'ok');
-
-            try {
-                label.textContent = 'Fetching…';
-                const list = await getVersions(worldId);
-                const entry = selected === 'latest'
-                    ? list[0]
-                    : list.find(v => String(v.version) === selected) || list[0];
-                download(entry.url);
-                flash('ok', `Downloading v${entry.version} ✓`);
-            } catch (err) {
-                console.error('[VRCW]', err);
-                button.title = String(err.message || err);
-                flash('err', 'Error — tap to retry');
-            }
-        });
-
-        function flash(state, text) {
-            button.classList.add(state);
-            label.textContent = text;
-            setTimeout(() => {
-                button.classList.remove(state);
-                label.textContent = '⬇ Download VRCW';
+            const reset = () => {
+                label.textContent = idle;
                 button.disabled = false;
                 delete button.dataset.busy;
-            }, state === 'ok' ? 2500 : 3000);
+            };
+            const flash = (state, text, hold) => {
+                button.classList.add(state);
+                label.textContent = text;
+                setTimeout(() => { button.classList.remove(state); reset(); }, hold);
+            };
+
+            button.addEventListener('mousedown', swallow);
+            button.addEventListener('click', async ev => {
+                swallow(ev);
+                if (button.dataset.busy) return;
+                button.dataset.busy = '1';
+                button.disabled = true;
+                button.classList.remove('err', 'ok');
+
+                try {
+                    label.textContent = compact ? '…' : 'Fetching…';
+                    const list = await getVersions(worldId);
+                    const entry = selected === 'latest'
+                        ? list[0]
+                        : list.find(v => String(v.version) === selected) || list[0];
+                    download(entry.url);
+                    flash('ok', compact ? `v${entry.version} ✓` : `Downloading v${entry.version} ✓`, 2500);
+                } catch (err) {
+                    console.error('[VRCW]', err);
+                    button.title = String(err.message || err);
+                    flash('err', compact ? '✕ retry' : 'Error — tap to retry', 3000);
+                }
+            });
+            return button;
         }
 
-        // --- version dropdown ---
-        const picker = document.createElement('div');
-        picker.className = 'vrcw-ver';
+        function makePicker() {
+            const picker = document.createElement('div');
+            picker.className = 'vrcw-ver';
 
-        const trigger = document.createElement('button');
-        trigger.type = 'button';
-        trigger.className = 'vrcw-ver-trigger';
-        trigger.textContent = 'Latest ▾';
+            const trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.className = 'vrcw-ver-trigger';
+            trigger.textContent = 'Latest ▾';
+            picker.appendChild(trigger);
 
-        const menu = document.createElement('div');
-        menu.className = 'vrcw-ver-menu';
-        menu.hidden = true;
+            let menu = null;
+            let loaded = null;
 
-        picker.append(trigger, menu);
+            const closeOnOutside = e => {
+                if (menu && !menu.contains(e.target) && e.target !== trigger) close();
+            };
 
-        const closeOnOutside = e => { if (!picker.contains(e.target)) close(); };
-        function open()  { menu.hidden = false; document.addEventListener('click', closeOnOutside, true); }
-        function close() { menu.hidden = true;  document.removeEventListener('click', closeOnOutside, true); }
-
-        function renderMenu(list) {
-            menu.innerHTML = '';
-            const options = [{ value: 'latest', text: `Latest (v${list[0].version})` }]
-                .concat(list.map(v => ({ value: String(v.version), text: `v${v.version}` })));
-
-            for (const opt of options) {
-                const item = document.createElement('button');
-                item.type = 'button';
-                item.className = 'vrcw-ver-item';
-                item.textContent = opt.text;
-                item.addEventListener('click', e => {
-                    swallow(e);
-                    selected = opt.value;
-                    trigger.textContent = (opt.value === 'latest' ? 'Latest' : opt.text) + ' ▾';
-                    close();
-                });
-                menu.appendChild(item);
+            function close() {
+                if (!menu) return;
+                menu.remove();
+                menu = null;
+                document.removeEventListener('click', closeOnOutside, true);
+                window.removeEventListener('scroll', close, true);
+                window.removeEventListener('resize', close);
             }
-        }
 
-        async function loadMenu() {
-            menu.innerHTML = '<div class="vrcw-ver-msg">Loading…</div>';
-            try {
-                loaded = await getVersions(worldId);
-                renderMenu(loaded);
-            } catch (err) {
-                console.error('[VRCW]', err);
-                loaded = null;
-                const msg = document.createElement('div');
-                msg.className = 'vrcw-ver-msg err';
-                msg.textContent = 'Error — tap to retry';
-                msg.addEventListener('click', e => { e.stopPropagation(); loadMenu(); });
-                menu.innerHTML = '';
-                menu.appendChild(msg);
+            function open() {
+                menu = document.createElement('div');
+                menu.className = 'vrcw-ver-menu';
+                document.body.appendChild(menu);
+                showMessage('Loading…');
+                document.addEventListener('click', closeOnOutside, true);
+                window.addEventListener('scroll', close, true);
+                window.addEventListener('resize', close);
+                loaded ? render(loaded) : load();
             }
+
+            // Pin under the trigger with right edges aligned (menu lives in <body>).
+            function reposition() {
+                const r = trigger.getBoundingClientRect();
+                menu.style.top = `${r.bottom + 4}px`;
+                menu.style.right = `${window.innerWidth - r.right}px`;
+            }
+
+            function showMessage(text, isError = false) {
+                menu.className = 'vrcw-ver-menu vrcw-ver-msg' + (isError ? ' err' : '');
+                menu.textContent = text;
+                reposition();
+            }
+
+            function render(list) {
+                menu.className = 'vrcw-ver-menu';
+                menu.textContent = '';
+
+                const options = [{ value: 'latest', text: `Latest (v${list[0].version})` }]
+                    .concat(list.map(v => ({ value: String(v.version), text: `v${v.version}` })));
+
+                for (const opt of options) {
+                    const item = document.createElement('button');
+                    item.type = 'button';
+                    item.className = 'vrcw-ver-item';
+                    item.textContent = opt.text;
+                    item.addEventListener('click', e => {
+                        swallow(e);
+                        selected = opt.value;
+                        trigger.textContent = (opt.value === 'latest' ? 'Latest' : opt.text) + ' ▾';
+                        close();
+                    });
+                    menu.appendChild(item);
+                }
+                reposition();
+            }
+
+            async function load() {
+                try {
+                    loaded = await getVersions(worldId);
+                    if (menu) render(loaded);
+                } catch (err) {
+                    console.error('[VRCW]', err);
+                    if (!menu) return;
+                    showMessage('Error — tap to retry', true);
+                    menu.onclick = e => { e.stopPropagation(); close(); open(); };
+                }
+            }
+
+            trigger.addEventListener('mousedown', e => e.stopPropagation());
+            trigger.addEventListener('click', e => { swallow(e); menu ? close() : open(); });
+
+            return picker;
         }
-
-        trigger.addEventListener('mousedown', e => e.stopPropagation());
-        trigger.addEventListener('click', e => {
-            swallow(e);
-            if (!menu.hidden) return close();
-            open();
-            loaded ? renderMenu(loaded) : loadMenu();
-        });
-
-        row.append(button, picker);
-        return row;
-    }
-
-    function swallow(e) {
-        e.preventDefault();
-        e.stopPropagation();
     }
 
     // ------------------------------------------------------------------
@@ -330,8 +372,7 @@
                (outline > 0 && cs.outlineStyle !== 'none');
     }
 
-    // Walk up until the parent would include a second world, keeping track of
-    // the outermost bordered ancestor (the framed search-result card).
+    // Search cards: outermost bordered ancestor that still wraps a single world.
     function findCard(anchor) {
         let card = anchor;
         let framed = null;
@@ -343,12 +384,23 @@
         return { card, framed };
     }
 
-    function place(card, framed, controls) {
-        // Search cards: drop it below the tags, inside the frame.
+    // Discover tiles: nearest bordered box. Stopping at the border keeps a
+    // single-item carousel (the hero) from climbing up to the section header.
+    function overlayTile(anchor) {
+        let el = anchor.parentElement;
+        while (el && el !== document.body && countWorlds(el) <= 1) {
+            if (isFramed(el)) return el;
+            el = el.parentElement;
+        }
+        return anchor.parentElement;
+    }
+
+    function placeInFlow(card, framed, controls) {
+        // Search cards: below the tags, inside the frame.
         if (framed) return framed.appendChild(controls);
 
-        // My Worlds tiles have no frame and a fixed height that clips a bottom
-        // child, so sit the controls just after the title row instead.
+        // My Worlds tiles have a fixed height that clips a bottom child, so sit
+        // the controls right after the title row instead.
         const links = [...card.querySelectorAll(WORLD_LINK)];
         const title = links.find(a => !a.querySelector('img')) || links[0];
         if (title && title.parentElement && card.contains(title.parentElement)) {
@@ -358,16 +410,30 @@
         }
     }
 
+    function placeOverlay(tile, controls) {
+        if (getComputedStyle(tile).position === 'static') tile.style.position = 'relative';
+        controls.classList.add('vrcw-overlay');
+        tile.appendChild(controls);
+    }
+
     function addToCards(root) {
         root.querySelectorAll(WORLD_LINK).forEach(anchor => {
             const m = (anchor.getAttribute('href') || '').match(WORLD_ID_RE);
             if (!m || m[1] === currentWorldId()) return; // detail page handles its own world
 
-            const { card, framed } = findCard(anchor);
-            if (!card.querySelector('img')) return;             // not a real card
-            if (card.querySelector('.vrcw-dl-btn')) return;     // already added
-
-            place(card, framed, makeControls(m[1]));
+            // Discover uses full-card overlay links over a CSS-background thumbnail;
+            // other pages wrap their own <img> in normal flow.
+            if (getComputedStyle(anchor).position === 'absolute') {
+                const tile = overlayTile(anchor);
+                if (!tile.querySelector('.vrcw-overlay')) {
+                    placeOverlay(tile, makeControls(m[1], { compact: true }));
+                }
+            } else {
+                const { card, framed } = findCard(anchor);
+                if (!card.querySelector('.vrcw-dl-btn') && card.querySelector('img')) {
+                    placeInFlow(card, framed, makeControls(m[1]));
+                }
+            }
         });
     }
 
