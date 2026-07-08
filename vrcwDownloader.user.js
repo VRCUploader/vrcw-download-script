@@ -268,17 +268,13 @@
             let loaded = null;
 
             const closeOnOutside = e => {
-                if (menu && !menu.contains(e.target) && e.target !== trigger) close();
+                if (menu && !menu.contains(e.target) && !trigger.contains(e.target)) close();
             };
 
-            function close() {
-                if (!menu) return;
-                menu.remove();
-                menu = null;
-                document.removeEventListener('click', closeOnOutside, true);
-                window.removeEventListener('scroll', close, true);
-                window.removeEventListener('resize', close);
-            }
+            // Close on page/carousel scroll, but not when scrolling inside the menu.
+            const onScroll = e => {
+                if (menu && !menu.contains(e.target)) close();
+            };
 
             function open() {
                 menu = document.createElement('div');
@@ -286,9 +282,18 @@
                 document.body.appendChild(menu);
                 showMessage('Loading…');
                 document.addEventListener('click', closeOnOutside, true);
-                window.addEventListener('scroll', close, true);
+                window.addEventListener('scroll', onScroll, true);
                 window.addEventListener('resize', close);
                 loaded ? render(loaded) : load();
+            }
+
+            function close() {
+                if (!menu) return;
+                menu.remove();
+                menu = null;
+                document.removeEventListener('click', closeOnOutside, true);
+                window.removeEventListener('scroll', onScroll, true);
+                window.removeEventListener('resize', close);
             }
 
             // Pin under the trigger with right edges aligned (menu lives in <body>).
