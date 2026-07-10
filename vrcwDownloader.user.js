@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VRChat World Downloader
 // @namespace    https://vrchat.com/
-// @version      2.3
+// @version      2.5
 // @description  Adds a download button + platform/version picker to VRChat world search results, "My Worlds", Discover Worlds, and individual world pages. Downloads the chosen .vrcw bundle for PC, Android, or iOS.
 // @author       VRCUploader Team
 // @match        https://vrchat.com/*
@@ -16,8 +16,6 @@
 
     const WORLD_LINK = 'a[href*="/home/world/wrld_"]';
     const WORLD_ID_RE = /(wrld_[0-9a-fA-F-]{36})/;
-    // Asset URLs look like .../api/1/file/file_xxx/485/file. Match the id and
-    // version in the /file/ segment, not the 1 in /api/1/.
     const FILE_ID_RE = /\/file\/(file_[0-9a-fA-F-]+)\//;
     const VERSION_RE = /\/file\/(file_[0-9a-fA-F-]+)\/(\d+)\//;
 
