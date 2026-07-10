@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         VRChat World Search — Download Button
+// @name         VRChat World Downloader
 // @namespace    https://vrchat.com/
-// @version      2.1
+// @version      2.3
 // @description  Adds a download button + platform/version picker to VRChat world search results, "My Worlds", Discover Worlds, and individual world pages. Downloads the chosen .vrcw bundle for PC, Android, or iOS.
 // @author       VRCUploader Team
 // @match        https://vrchat.com/*
@@ -16,7 +16,10 @@
 
     const WORLD_LINK = 'a[href*="/home/world/wrld_"]';
     const WORLD_ID_RE = /(wrld_[0-9a-fA-F-]{36})/;
-    const VERSION_RE = /\/file\/[^/]+\/(\d+)\//; // .../file/file_xxx/485/file -> 485
+    // Asset URLs look like .../api/1/file/file_xxx/485/file. Match the id and
+    // version in the /file/ segment, not the 1 in /api/1/.
+    const FILE_ID_RE = /\/file\/(file_[0-9a-fA-F-]+)\//;
+    const VERSION_RE = /\/file\/(file_[0-9a-fA-F-]+)\/(\d+)\//;
 
     const PLATFORMS = [
         { id: 'standalonewindows', label: 'PC' },
@@ -115,12 +118,22 @@
         }
         .vrcw-ver-item:hover { background: rgba(50, 120, 220, 0.9); }
         .vrcw-ver-item.active { background: rgba(50, 120, 220, 0.55); }
+        .vrcw-ver-item.missing { color: #888; }
+        .vrcw-ver-item.missing:hover { background: rgba(80, 80, 95, 0.9); }
         .vrcw-ver-msg {
             padding: 8px 12px;
             color: #ddd;
             font: 500 13px/1 system-ui, sans-serif;
         }
         .vrcw-ver-msg.err { color: #ff8080; cursor: pointer; }
+        .vrcw-ver-note {
+            padding: 8px 12px;
+            color: #c8b06a;
+            font: 500 12px/1.35 system-ui, sans-serif;
+            border-bottom: 1px solid rgba(255,255,255,0.12);
+            white-space: normal;
+            max-width: 220px;
+        }
     `;
     document.head.appendChild(style);
 
@@ -128,8 +141,9 @@
     // API
     // ------------------------------------------------------------------
 
-    // One fetch per world, shared between the button and the dropdowns.
+    // One fetch per world / file, shared between the button and the dropdowns.
     const packageCache = new Map();
+    const fileMetaCache = new Map();
 
     async function fetchUnityPackages(worldId) {
         const endpoints = [
@@ -138,9 +152,9 @@
         ];
         for (const url of endpoints) {
             try {
-                const res = await fetch(url, { credentials: 'include' });
-                if (!res.ok) continue;
-                const packages = readPackages(await res.json());
+                const response = await fetch(url, { credentials: 'include' });
+                if (!response.ok) continue;
+                const packages = readPackages(await response.json());
                 if (packages.length) return packages;
             } catch {
                 // try the next endpoint
@@ -161,25 +175,89 @@
     }
 
     function platformLabel(platformId) {
-        return PLATFORMS.find(p => p.id === platformId)?.label || platformId;
+        return PLATFORMS.find(platform => platform.id === platformId)?.label || platformId;
     }
 
+    // Only rewrite the version number after the file id, not the 1 in /api/1/.
     function versionUrl(template, version) {
-        return template.replace(/\/(\d+)(\/file)/, `/${version}$2`);
+        return template.replace(
+            /\/file\/(file_[0-9a-fA-F-]+)\/\d+(\/|$)/,
+            `/file/$1/${version}$2`
+        );
+    }
+
+    // Versions of a file that actually have downloadable data. A version entry
+    // can still exist after its data is gone (deleted flag, missing file blob,
+    // or a size of 0 bytes).
+    async function getAvailableVersions(fileId) {
+        if (!fileMetaCache.has(fileId)) {
+            const promise = (async () => {
+                const response = await fetch(`https://vrchat.com/api/1/file/${fileId}`, {
+                    credentials: 'include',
+                });
+                if (!response.ok) throw new Error('Could not check file versions');
+                const data = await response.json();
+                const available = new Set();
+                for (const entry of data.versions || []) {
+                    if (!entry || entry.version < 1) continue;
+                    if (entry.deleted) continue;
+                    const file = entry.file;
+                    if (entry.status === 'complete'
+                        && file?.status === 'complete'
+                        && (file.sizeInBytes || 0) > 0) {
+                        available.add(entry.version);
+                    }
+                }
+                return available;
+            })();
+            promise.catch(() => fileMetaCache.delete(fileId));
+            fileMetaCache.set(fileId, promise);
+        }
+        return fileMetaCache.get(fileId);
+    }
+
+    // File ids currently used by a platform (security variants excluded).
+    function isDownloadableAsset(pkg, platform) {
+        return Boolean(pkg && pkg.platform === platform
+            && pkg.assetUrl && !pkg.assetUrl.includes('/variant/'));
+    }
+
+    function fileIdsForPlatform(packages, platform) {
+        const ids = new Set();
+        for (const pkg of packages) {
+            if (!isDownloadableAsset(pkg, platform)) continue;
+            const match = pkg.assetUrl.match(FILE_ID_RE);
+            if (match) ids.add(match[1]);
+        }
+        return ids;
+    }
+
+    // Platforms that currently share a file id with the given one. The API only
+    // lists each platform's latest upload, so older versions of a shared file
+    // can't be attributed reliably - warn instead of guessing.
+    function platformsSharingFile(packages, platform) {
+        const ours = fileIdsForPlatform(packages, platform);
+        if (!ours.size) return [];
+        return PLATFORMS
+            .filter(option => option.id !== platform)
+            .filter(option => {
+                const theirs = fileIdsForPlatform(packages, option.id);
+                return [...theirs].some(fileId => ours.has(fileId));
+            })
+            .map(option => option.label);
     }
 
     // Every version from latest down to 1. Entries present in unityPackages are verified.
-    function toVersionList(packages, platform) {
+    async function toVersionList(packages, platform) {
         const verified = new Map(); // version -> url
         let latest = 0;
         let template = null;
 
         for (const pkg of packages) {
-            if (!pkg || pkg.platform !== platform) continue;
+            if (!isDownloadableAsset(pkg, platform)) continue;
             const asset = pkg.assetUrl;
-            if (!asset || asset.includes('/variant/')) continue; // skip the security variant
             const match = asset.match(VERSION_RE);
-            const version = match ? parseInt(match[1], 10) : (pkg.assetVersion || 0);
+            const version = match ? parseInt(match[2], 10) : (pkg.assetVersion || 0);
             if (!version) continue;
             const url = asset.replace('api.vrchat.cloud', 'vrchat.com');
             verified.set(version, url);
@@ -191,12 +269,35 @@
 
         if (!latest || !template) return [];
 
+        // unityPackages can cite more than one file id for the same platform, so
+        // check availability per file instead of assuming they all share the latest.
+        const urls = new Map(); // version -> url
+        for (let version = latest; version >= 1; version--) {
+            urls.set(version, verified.get(version) || versionUrl(template, version));
+        }
+        const fileIds = new Set(
+            [...urls.values()].map(url => url.match(FILE_ID_RE)?.[1]).filter(Boolean));
+        const availability = new Map(); // fileId -> Set(version) | null
+        await Promise.all([...fileIds].map(async fileId => {
+            try {
+                availability.set(fileId, await getAvailableVersions(fileId));
+            } catch (error) {
+                console.warn('[VRCW] file meta lookup failed', fileId, error);
+                availability.set(fileId, null);
+            }
+        }));
+
         const versions = [];
-        for (let v = latest; v >= 1; v--) {
+        for (let version = latest; version >= 1; version--) {
+            const url = urls.get(version);
+            const fileId = url.match(FILE_ID_RE)?.[1];
+            const availableVersions = fileId ? availability.get(fileId) : null;
             versions.push({
-                version: v,
-                url: verified.get(v) || versionUrl(template, v),
-                verified: verified.has(v),
+                version,
+                url,
+                verified: verified.has(version),
+                // null = unknown (metadata lookup failed)
+                available: availableVersions ? availableVersions.has(version) : null,
             });
         }
         return versions;
@@ -216,7 +317,7 @@
 
     async function getVersions(worldId, platform) {
         const packages = await getPackages(worldId);
-        const list = toVersionList(packages, platform);
+        const list = await toVersionList(packages, platform);
         if (!list.length) {
             throw new Error(`No ${platformLabel(platform)} bundle found`);
         }
@@ -232,9 +333,9 @@
         link.remove();
     }
 
-    function swallow(e) {
-        e.preventDefault();
-        e.stopPropagation();
+    function stopEvent(event) {
+        event.preventDefault();
+        event.stopPropagation();
     }
 
     // ------------------------------------------------------------------
@@ -245,9 +346,10 @@
         const row = document.createElement('div');
         row.className = compact ? 'vrcw-row vrcw-compact' : 'vrcw-row';
 
-        let selected = 'latest';
+        let selectedVersion = 'latest';
         let platform = 'standalonewindows';
         let cachedVersions = null;
+        let sharedWith = [];
         let onPlatformChange = null;
         let versionTrigger = null;
 
@@ -268,15 +370,15 @@
                 button.disabled = false;
                 delete button.dataset.busy;
             };
-            const flash = (state, text, hold) => {
+            const flash = (state, text, holdMs) => {
                 button.classList.add(state);
                 label.textContent = text;
-                setTimeout(() => { button.classList.remove(state); reset(); }, hold);
+                setTimeout(() => { button.classList.remove(state); reset(); }, holdMs);
             };
 
-            button.addEventListener('mousedown', swallow);
-            button.addEventListener('click', async ev => {
-                swallow(ev);
+            button.addEventListener('mousedown', stopEvent);
+            button.addEventListener('click', async event => {
+                stopEvent(event);
                 if (button.dataset.busy) return;
                 button.dataset.busy = '1';
                 button.disabled = true;
@@ -285,15 +387,22 @@
                 try {
                     label.textContent = compact ? '…' : 'Fetching…';
                     const list = await getVersions(worldId, platform);
-                    const entry = selected === 'latest'
+                    const entry = selectedVersion === 'latest'
                         ? list[0]
-                        : list.find(v => String(v.version) === selected) || list[0];
+                        : list.find(item => String(item.version) === selectedVersion) || list[0];
+                    if (entry.available === false) {
+                        throw new Error(`v${entry.version} is not available`);
+                    }
                     download(entry.url);
                     flash('ok', compact ? `v${entry.version} ✓` : `Downloading v${entry.version} ✓`, 2500);
-                } catch (err) {
-                    console.error('[VRCW]', err);
-                    button.title = String(err.message || err);
-                    flash('err', compact ? '✕ retry' : 'Error — tap to retry', 3000);
+                } catch (error) {
+                    console.error('[VRCW]', error);
+                    button.title = String(error.message || error);
+                    const message = String(error.message || '');
+                    const noBundle = /No .+ bundle found/.test(message);
+                    flash('err', compact
+                        ? (message.includes('not available') || noBundle ? '✕ none' : '✕ retry')
+                        : (message || 'Error - tap to retry'), 3000);
                 }
             });
 
@@ -315,21 +424,21 @@
 
             let menu = null;
 
-            const closeOnOutside = e => {
-                if (menu && !menu.contains(e.target) && !trigger.contains(e.target)) close();
+            const closeOnOutsideClick = event => {
+                if (menu && !menu.contains(event.target) && !trigger.contains(event.target)) close();
             };
 
             // Close on page/carousel scroll, but not when scrolling inside the menu.
-            const onScroll = e => {
-                if (menu && !menu.contains(e.target)) close();
+            const closeOnOutsideScroll = event => {
+                if (menu && !menu.contains(event.target)) close();
             };
 
             function open() {
                 menu = document.createElement('div');
                 menu.className = 'vrcw-ver-menu';
                 document.body.appendChild(menu);
-                document.addEventListener('click', closeOnOutside, true);
-                window.addEventListener('scroll', onScroll, true);
+                document.addEventListener('click', closeOnOutsideClick, true);
+                window.addEventListener('scroll', closeOnOutsideScroll, true);
                 window.addEventListener('resize', close);
                 buildItems(menu, { showMessage, reposition, close, trigger });
             }
@@ -338,16 +447,16 @@
                 if (!menu) return;
                 menu.remove();
                 menu = null;
-                document.removeEventListener('click', closeOnOutside, true);
-                window.removeEventListener('scroll', onScroll, true);
+                document.removeEventListener('click', closeOnOutsideClick, true);
+                window.removeEventListener('scroll', closeOnOutsideScroll, true);
                 window.removeEventListener('resize', close);
             }
 
             // Pin under the trigger with right edges aligned (menu lives in <body>).
             function reposition() {
-                const r = trigger.getBoundingClientRect();
-                menu.style.top = `${r.bottom + 4}px`;
-                menu.style.right = `${window.innerWidth - r.right}px`;
+                const rect = trigger.getBoundingClientRect();
+                menu.style.top = `${rect.bottom + 4}px`;
+                menu.style.right = `${window.innerWidth - rect.right}px`;
             }
 
             function showMessage(text, isError = false) {
@@ -356,8 +465,12 @@
                 reposition();
             }
 
-            trigger.addEventListener('mousedown', e => e.stopPropagation());
-            trigger.addEventListener('click', e => { swallow(e); menu ? close() : open(); });
+            trigger.addEventListener('mousedown', event => event.stopPropagation());
+            trigger.addEventListener('click', event => {
+                stopEvent(event);
+                if (menu) close();
+                else open();
+            });
 
             return { picker, trigger, close };
         }
@@ -369,18 +482,19 @@
                     menu.className = 'vrcw-ver-menu';
                     menu.textContent = '';
 
-                    for (const p of PLATFORMS) {
+                    for (const option of PLATFORMS) {
                         const item = document.createElement('button');
                         item.type = 'button';
-                        item.className = 'vrcw-ver-item' + (p.id === platform ? ' active' : '');
-                        item.textContent = p.label;
-                        item.addEventListener('click', e => {
-                            swallow(e);
-                            if (p.id !== platform) {
-                                platform = p.id;
-                                selected = 'latest';
+                        item.className = 'vrcw-ver-item' + (option.id === platform ? ' active' : '');
+                        item.textContent = option.label;
+                        item.addEventListener('click', event => {
+                            stopEvent(event);
+                            if (option.id !== platform) {
+                                platform = option.id;
+                                selectedVersion = 'latest';
                                 cachedVersions = null;
-                                trigger.textContent = p.label + ' ▾';
+                                sharedWith = [];
+                                trigger.textContent = option.label + ' ▾';
                                 versionTrigger.textContent = 'Latest ▾';
                                 onPlatformChange?.();
                             }
@@ -413,26 +527,42 @@
                 menu.className = 'vrcw-ver-menu';
                 menu.textContent = '';
 
+                if (sharedWith.length) {
+                    const note = document.createElement('div');
+                    note.className = 'vrcw-ver-note';
+                    note.textContent = `Shares file with ${sharedWith.join(', ')} - `
+                        + 'older versions may belong to another platform';
+                    menu.appendChild(note);
+                }
+
                 const latest = list[0];
                 const options = [{
                     value: 'latest',
                     text: `Latest (v${latest.version})${latest.verified ? ' ✓' : ''}`,
                     triggerText: 'Latest',
-                }].concat(list.map(v => ({
-                    value: String(v.version),
-                    text: `v${v.version}${v.verified ? ' ✓' : ''}`,
-                    triggerText: `v${v.version}${v.verified ? ' ✓' : ''}`,
-                })));
+                    missing: latest.available === false,
+                }].concat(list.map(entry => {
+                    const missing = entry.available === false;
+                    const mark = missing ? ' ✕' : (entry.verified ? ' ✓' : '');
+                    return {
+                        value: String(entry.version),
+                        text: `v${entry.version}${mark}`,
+                        triggerText: `v${entry.version}${mark}`,
+                        missing,
+                    };
+                }));
 
-                for (const opt of options) {
+                for (const option of options) {
                     const item = document.createElement('button');
                     item.type = 'button';
-                    item.className = 'vrcw-ver-item' + (opt.value === selected ? ' active' : '');
-                    item.textContent = opt.text;
-                    item.addEventListener('click', e => {
-                        swallow(e);
-                        selected = opt.value;
-                        trigger.textContent = opt.triggerText + ' ▾';
+                    item.className = 'vrcw-ver-item'
+                        + (option.value === selectedVersion ? ' active' : '')
+                        + (option.missing ? ' missing' : '');
+                    item.textContent = option.text;
+                    item.addEventListener('click', event => {
+                        stopEvent(event);
+                        selectedVersion = option.value;
+                        trigger.textContent = option.triggerText + ' ▾';
                         close();
                     });
                     menu.appendChild(item);
@@ -442,14 +572,23 @@
 
             async function load(menu, { showMessage, reposition, close, trigger }) {
                 try {
+                    // getVersions reuses the cached package fetch, so this is one request.
+                    const packages = await getPackages(worldId);
+                    sharedWith = platformsSharingFile(packages, platform);
                     cachedVersions = await getVersions(worldId, platform);
                     if (menu.isConnected) render(cachedVersions, menu, { reposition, close, trigger });
-                } catch (err) {
-                    console.error('[VRCW]', err);
+                } catch (error) {
+                    console.error('[VRCW]', error);
                     if (!menu.isConnected) return;
-                    showMessage('Error — tap to retry', true);
-                    menu.onclick = e => {
-                        e.stopPropagation();
+                    const message = String(error.message || '');
+                    // Missing platform builds aren't transient, so don't invite a retry.
+                    if (/No .+ bundle found/.test(message)) {
+                        showMessage(message);
+                        return;
+                    }
+                    showMessage('Error - tap to retry', true);
+                    menu.onclick = event => {
+                        event.stopPropagation();
                         close();
                         trigger.click();
                     };
@@ -463,25 +602,25 @@
     // ------------------------------------------------------------------
 
     function currentWorldId() {
-        const m = location.pathname.match(WORLD_ID_RE);
-        return m ? m[1] : null;
+        const match = location.pathname.match(WORLD_ID_RE);
+        return match ? match[1] : null;
     }
 
-    function countWorlds(el) {
+    function countWorlds(element) {
         const ids = new Set();
-        el.querySelectorAll(WORLD_LINK).forEach(a => {
-            const m = (a.getAttribute('href') || '').match(WORLD_ID_RE);
-            if (m) ids.add(m[1]);
+        element.querySelectorAll(WORLD_LINK).forEach(anchor => {
+            const match = (anchor.getAttribute('href') || '').match(WORLD_ID_RE);
+            if (match) ids.add(match[1]);
         });
         return ids.size;
     }
 
-    function isFramed(el) {
-        const cs = getComputedStyle(el);
-        const border = parseFloat(cs.borderTopWidth) || 0;
-        const outline = parseFloat(cs.outlineWidth) || 0;
-        return (border > 0 && cs.borderTopStyle !== 'none') ||
-               (outline > 0 && cs.outlineStyle !== 'none');
+    function isFramed(element) {
+        const styles = getComputedStyle(element);
+        const border = parseFloat(styles.borderTopWidth) || 0;
+        const outline = parseFloat(styles.outlineWidth) || 0;
+        return (border > 0 && styles.borderTopStyle !== 'none') ||
+               (outline > 0 && styles.outlineStyle !== 'none');
     }
 
     // Search cards: outermost bordered ancestor that still wraps a single world.
@@ -499,10 +638,10 @@
     // Discover tiles: nearest bordered box. Stopping at the border keeps a
     // single-item carousel (the hero) from climbing up to the section header.
     function overlayTile(anchor) {
-        let el = anchor.parentElement;
-        while (el && el !== document.body && countWorlds(el) <= 1) {
-            if (isFramed(el)) return el;
-            el = el.parentElement;
+        let element = anchor.parentElement;
+        while (element && element !== document.body && countWorlds(element) <= 1) {
+            if (isFramed(element)) return element;
+            element = element.parentElement;
         }
         return anchor.parentElement;
     }
@@ -514,7 +653,7 @@
         // My Worlds tiles have a fixed height that clips a bottom child, so sit
         // the controls right after the title row instead.
         const links = [...card.querySelectorAll(WORLD_LINK)];
-        const title = links.find(a => !a.querySelector('img')) || links[0];
+        const title = links.find(link => !link.querySelector('img')) || links[0];
         if (title && title.parentElement && card.contains(title.parentElement)) {
             title.parentElement.insertAdjacentElement('afterend', controls);
         } else {
@@ -528,8 +667,9 @@
         tile.appendChild(controls);
     }
 
-    // Uploaded-worlds modal / My Worlds use narrow "World Card" tiles; the image
-    // wrapper counts as framed, so !framed is the wrong compact signal there.
+    // The uploaded-worlds modal and My Worlds use narrow "World Card" tiles
+    // whose image wrapper counts as framed, so !framed alone is not enough
+    // to decide when to go compact.
     function useCompactControls(card, framed) {
         if (!framed) return true;
         if (card.getAttribute('aria-label') === 'World Card') return true;
@@ -540,20 +680,20 @@
 
     function addToCards(root) {
         root.querySelectorAll(WORLD_LINK).forEach(anchor => {
-            const m = (anchor.getAttribute('href') || '').match(WORLD_ID_RE);
-            if (!m || m[1] === currentWorldId()) return; // detail page handles its own world
+            const worldId = (anchor.getAttribute('href') || '').match(WORLD_ID_RE)?.[1];
+            if (!worldId || worldId === currentWorldId()) return; // detail page handles its own world
 
-            // Discover uses full-card overlay links over a CSS-background thumbnail;
-            // other pages wrap their own <img> in normal flow.
+            // Discover puts a full-card overlay link on top of a CSS background
+            // thumbnail, while other pages wrap a normal <img> in the page flow.
             if (getComputedStyle(anchor).position === 'absolute') {
                 const tile = overlayTile(anchor);
                 if (!tile.querySelector('.vrcw-overlay')) {
-                    placeOverlay(tile, makeControls(m[1], { compact: true }));
+                    placeOverlay(tile, makeControls(worldId, { compact: true }));
                 }
             } else {
                 const { card, framed } = findCard(anchor);
                 if (!card.querySelector('.vrcw-dl-btn') && card.querySelector('img')) {
-                    placeInFlow(card, framed, makeControls(m[1], {
+                    placeInFlow(card, framed, makeControls(worldId, {
                         compact: useCompactControls(card, framed),
                     }));
                 }
@@ -565,7 +705,10 @@
         const worldId = currentWorldId();
         const existing = document.querySelector('.vrcw-detail');
 
-        if (!worldId) return existing && existing.remove();
+        if (!worldId) {
+            existing?.remove();
+            return;
+        }
         if (existing) {
             if (existing.dataset.worldId === worldId) return;
             existing.remove(); // navigated to a different world
