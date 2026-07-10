@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VRChat World Search — Download Button
 // @namespace    https://vrchat.com/
-// @version      2.0
-// @description  Adds a download button + version picker to VRChat world search results, "My Worlds", Discover Worlds, and individual world pages. Downloads the chosen PC (standalonewindows) .vrcw bundle.
+// @version      2.1
+// @description  Adds a download button + platform/version picker to VRChat world search results, "My Worlds", Discover Worlds, and individual world pages. Downloads the chosen .vrcw bundle for PC, Android, or iOS.
 // @author       VRCUploader Team
 // @match        https://vrchat.com/*
 // @run-at       document-idle
@@ -17,6 +17,12 @@
     const WORLD_LINK = 'a[href*="/home/world/wrld_"]';
     const WORLD_ID_RE = /(wrld_[0-9a-fA-F-]{36})/;
     const VERSION_RE = /\/file\/[^/]+\/(\d+)\//; // .../file/file_xxx/485/file -> 485
+
+    const PLATFORMS = [
+        { id: 'standalonewindows', label: 'PC' },
+        { id: 'android', label: 'Android' },
+        { id: 'ios', label: 'iOS' },
+    ];
 
     const style = document.createElement('style');
     style.textContent = `
@@ -81,6 +87,7 @@
             padding: 6px 9px;
             font-size: 12px;
         }
+        .vrcw-row.vrcw-compact:not(.vrcw-overlay) { margin: 6px 0; gap: 6px; }
 
         /* Lives in <body> so a card's overflow:hidden can't clip it. */
         .vrcw-ver-menu {
@@ -107,6 +114,7 @@
             white-space: nowrap;
         }
         .vrcw-ver-item:hover { background: rgba(50, 120, 220, 0.9); }
+        .vrcw-ver-item.active { background: rgba(50, 120, 220, 0.55); }
         .vrcw-ver-msg {
             padding: 8px 12px;
             color: #ddd;
@@ -120,8 +128,8 @@
     // API
     // ------------------------------------------------------------------
 
-    // One fetch per world, shared between the button and the dropdown.
-    const versionCache = new Map();
+    // One fetch per world, shared between the button and the dropdowns.
+    const packageCache = new Map();
 
     async function fetchUnityPackages(worldId) {
         const endpoints = [
@@ -134,7 +142,7 @@
                 if (!res.ok) continue;
                 const packages = readPackages(await res.json());
                 if (packages.length) return packages;
-            } catch (e) {
+            } catch {
                 // try the next endpoint
             }
         }
@@ -152,35 +160,67 @@
         return [];
     }
 
-    function toVersionList(packages) {
-        const versions = [];
-        for (const pkg of packages) {
-            if (!pkg || pkg.platform !== 'standalonewindows') continue; // PC only
-            const asset = pkg.assetUrl;
-            if (!asset || asset.includes('/variant/')) continue;        // skip the security variant
-            const match = asset.match(VERSION_RE);
-            versions.push({
-                version: match ? parseInt(match[1], 10) : (pkg.assetVersion || 0),
-                url: asset.replace('api.vrchat.cloud', 'vrchat.com'),   // logged-in host
-            });
-        }
-        versions.sort((a, b) => b.version - a.version);
-
-        const seen = new Set();
-        return versions.filter(v => !seen.has(v.version) && seen.add(v.version));
+    function platformLabel(platformId) {
+        return PLATFORMS.find(p => p.id === platformId)?.label || platformId;
     }
 
-    function getVersions(worldId) {
-        if (!versionCache.has(worldId)) {
-            const promise = fetchUnityPackages(worldId).then(packages => {
-                const list = toVersionList(packages);
-                if (!list.length) throw new Error('No PC bundle found (are you logged in?)');
-                return list;
-            });
-            promise.catch(() => versionCache.delete(worldId)); // let a failed lookup retry
-            versionCache.set(worldId, promise);
+    function versionUrl(template, version) {
+        return template.replace(/\/(\d+)(\/file)/, `/${version}$2`);
+    }
+
+    // Every version from latest down to 1. Entries present in unityPackages are verified.
+    function toVersionList(packages, platform) {
+        const verified = new Map(); // version -> url
+        let latest = 0;
+        let template = null;
+
+        for (const pkg of packages) {
+            if (!pkg || pkg.platform !== platform) continue;
+            const asset = pkg.assetUrl;
+            if (!asset || asset.includes('/variant/')) continue; // skip the security variant
+            const match = asset.match(VERSION_RE);
+            const version = match ? parseInt(match[1], 10) : (pkg.assetVersion || 0);
+            if (!version) continue;
+            const url = asset.replace('api.vrchat.cloud', 'vrchat.com');
+            verified.set(version, url);
+            if (version > latest) {
+                latest = version;
+                template = url;
+            }
         }
-        return versionCache.get(worldId);
+
+        if (!latest || !template) return [];
+
+        const versions = [];
+        for (let v = latest; v >= 1; v--) {
+            versions.push({
+                version: v,
+                url: verified.get(v) || versionUrl(template, v),
+                verified: verified.has(v),
+            });
+        }
+        return versions;
+    }
+
+    function getPackages(worldId) {
+        if (!packageCache.has(worldId)) {
+            const promise = fetchUnityPackages(worldId).then(packages => {
+                if (!packages.length) throw new Error('No bundles found (are you logged in?)');
+                return packages;
+            });
+            promise.catch(() => packageCache.delete(worldId)); // let a failed lookup retry
+            packageCache.set(worldId, promise);
+        }
+        return packageCache.get(worldId);
+    }
+
+    async function getVersions(worldId, platform) {
+        const packages = await getPackages(worldId);
+        const list = toVersionList(packages, platform);
+        if (!list.length) {
+            throw new Error(`No ${platformLabel(platform)} bundle found`);
+        }
+        return list;
     }
 
     function download(url) {
@@ -206,7 +246,12 @@
         row.className = compact ? 'vrcw-row vrcw-compact' : 'vrcw-row';
 
         let selected = 'latest';
-        row.append(makeButton(), makePicker());
+        let platform = 'standalonewindows';
+        let cachedVersions = null;
+        let onPlatformChange = null;
+        let versionTrigger = null;
+
+        row.append(makeButton(), makePlatformPicker(), makeVersionPicker());
         return row;
 
         function makeButton() {
@@ -214,7 +259,7 @@
             const button = document.createElement('button');
             button.type = 'button';
             button.className = 'vrcw-dl-btn';
-            button.title = 'Download PC (.vrcw) bundle';
+            button.title = `Download ${platformLabel(platform)} (.vrcw) bundle`;
             button.innerHTML = `<span class="vrcw-lbl">${idle}</span>`;
             const label = button.querySelector('.vrcw-lbl');
 
@@ -239,7 +284,7 @@
 
                 try {
                     label.textContent = compact ? '…' : 'Fetching…';
-                    const list = await getVersions(worldId);
+                    const list = await getVersions(worldId, platform);
                     const entry = selected === 'latest'
                         ? list[0]
                         : list.find(v => String(v.version) === selected) || list[0];
@@ -251,21 +296,24 @@
                     flash('err', compact ? '✕ retry' : 'Error — tap to retry', 3000);
                 }
             });
+
+            onPlatformChange = () => {
+                button.title = `Download ${platformLabel(platform)} (.vrcw) bundle`;
+            };
             return button;
         }
 
-        function makePicker() {
+        function makeDropdown({ triggerText, buildItems }) {
             const picker = document.createElement('div');
             picker.className = 'vrcw-ver';
 
             const trigger = document.createElement('button');
             trigger.type = 'button';
             trigger.className = 'vrcw-ver-trigger';
-            trigger.textContent = 'Latest ▾';
+            trigger.textContent = triggerText;
             picker.appendChild(trigger);
 
             let menu = null;
-            let loaded = null;
 
             const closeOnOutside = e => {
                 if (menu && !menu.contains(e.target) && !trigger.contains(e.target)) close();
@@ -280,11 +328,10 @@
                 menu = document.createElement('div');
                 menu.className = 'vrcw-ver-menu';
                 document.body.appendChild(menu);
-                showMessage('Loading…');
                 document.addEventListener('click', closeOnOutside, true);
                 window.addEventListener('scroll', onScroll, true);
                 window.addEventListener('resize', close);
-                loaded ? render(loaded) : load();
+                buildItems(menu, { showMessage, reposition, close, trigger });
             }
 
             function close() {
@@ -309,22 +356,83 @@
                 reposition();
             }
 
-            function render(list) {
+            trigger.addEventListener('mousedown', e => e.stopPropagation());
+            trigger.addEventListener('click', e => { swallow(e); menu ? close() : open(); });
+
+            return { picker, trigger, close };
+        }
+
+        function makePlatformPicker() {
+            const { picker, trigger } = makeDropdown({
+                triggerText: platformLabel(platform) + ' ▾',
+                buildItems(menu, { reposition, close, trigger }) {
+                    menu.className = 'vrcw-ver-menu';
+                    menu.textContent = '';
+
+                    for (const p of PLATFORMS) {
+                        const item = document.createElement('button');
+                        item.type = 'button';
+                        item.className = 'vrcw-ver-item' + (p.id === platform ? ' active' : '');
+                        item.textContent = p.label;
+                        item.addEventListener('click', e => {
+                            swallow(e);
+                            if (p.id !== platform) {
+                                platform = p.id;
+                                selected = 'latest';
+                                cachedVersions = null;
+                                trigger.textContent = p.label + ' ▾';
+                                versionTrigger.textContent = 'Latest ▾';
+                                onPlatformChange?.();
+                            }
+                            close();
+                        });
+                        menu.appendChild(item);
+                    }
+                    reposition();
+                },
+            });
+            return picker;
+        }
+
+        function makeVersionPicker() {
+            const { picker, trigger } = makeDropdown({
+                triggerText: 'Latest ▾',
+                buildItems(menu, { showMessage, reposition, close, trigger }) {
+                    if (cachedVersions) {
+                        render(cachedVersions, menu, { reposition, close, trigger });
+                    } else {
+                        showMessage('Loading…');
+                        load(menu, { showMessage, reposition, close, trigger });
+                    }
+                },
+            });
+            versionTrigger = trigger;
+            return picker;
+
+            function render(list, menu, { reposition, close, trigger }) {
                 menu.className = 'vrcw-ver-menu';
                 menu.textContent = '';
 
-                const options = [{ value: 'latest', text: `Latest (v${list[0].version})` }]
-                    .concat(list.map(v => ({ value: String(v.version), text: `v${v.version}` })));
+                const latest = list[0];
+                const options = [{
+                    value: 'latest',
+                    text: `Latest (v${latest.version})${latest.verified ? ' ✓' : ''}`,
+                    triggerText: 'Latest',
+                }].concat(list.map(v => ({
+                    value: String(v.version),
+                    text: `v${v.version}${v.verified ? ' ✓' : ''}`,
+                    triggerText: `v${v.version}${v.verified ? ' ✓' : ''}`,
+                })));
 
                 for (const opt of options) {
                     const item = document.createElement('button');
                     item.type = 'button';
-                    item.className = 'vrcw-ver-item';
+                    item.className = 'vrcw-ver-item' + (opt.value === selected ? ' active' : '');
                     item.textContent = opt.text;
                     item.addEventListener('click', e => {
                         swallow(e);
                         selected = opt.value;
-                        trigger.textContent = (opt.value === 'latest' ? 'Latest' : opt.text) + ' ▾';
+                        trigger.textContent = opt.triggerText + ' ▾';
                         close();
                     });
                     menu.appendChild(item);
@@ -332,22 +440,21 @@
                 reposition();
             }
 
-            async function load() {
+            async function load(menu, { showMessage, reposition, close, trigger }) {
                 try {
-                    loaded = await getVersions(worldId);
-                    if (menu) render(loaded);
+                    cachedVersions = await getVersions(worldId, platform);
+                    if (menu.isConnected) render(cachedVersions, menu, { reposition, close, trigger });
                 } catch (err) {
                     console.error('[VRCW]', err);
-                    if (!menu) return;
+                    if (!menu.isConnected) return;
                     showMessage('Error — tap to retry', true);
-                    menu.onclick = e => { e.stopPropagation(); close(); open(); };
+                    menu.onclick = e => {
+                        e.stopPropagation();
+                        close();
+                        trigger.click();
+                    };
                 }
             }
-
-            trigger.addEventListener('mousedown', e => e.stopPropagation());
-            trigger.addEventListener('click', e => { swallow(e); menu ? close() : open(); });
-
-            return picker;
         }
     }
 
@@ -421,6 +528,16 @@
         tile.appendChild(controls);
     }
 
+    // Uploaded-worlds modal / My Worlds use narrow "World Card" tiles; the image
+    // wrapper counts as framed, so !framed is the wrong compact signal there.
+    function useCompactControls(card, framed) {
+        if (!framed) return true;
+        if (card.getAttribute('aria-label') === 'World Card') return true;
+        if (card.closest('[role="dialog"]')) return true;
+        const width = card.getBoundingClientRect().width;
+        return width > 0 && width < 380;
+    }
+
     function addToCards(root) {
         root.querySelectorAll(WORLD_LINK).forEach(anchor => {
             const m = (anchor.getAttribute('href') || '').match(WORLD_ID_RE);
@@ -436,7 +553,9 @@
             } else {
                 const { card, framed } = findCard(anchor);
                 if (!card.querySelector('.vrcw-dl-btn') && card.querySelector('img')) {
-                    placeInFlow(card, framed, makeControls(m[1]));
+                    placeInFlow(card, framed, makeControls(m[1], {
+                        compact: useCompactControls(card, framed),
+                    }));
                 }
             }
         });
